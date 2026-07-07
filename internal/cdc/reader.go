@@ -3,8 +3,8 @@
 // Modifications from the upstream Reader:
 //   - Replaced the ports.WALEventHandler/Sink interface with a plain Handler
 //     callback and a single Run() entry point so callers don't need FX.
-//   - Public configuration is grouped in Config; sensible defaults are filled
-//     in by Run() so callers can pass a partly-zero value.
+//   - Public configuration is grouped in Config, and sensible defaults are
+//     filled in by Run() so callers can pass a partly-zero value.
 //   - Removed Stop() in favour of cancelling the context the caller passes in.
 
 package cdc
@@ -49,7 +49,7 @@ type Config struct {
 
 	// AutoCreatePub creates (or reconciles) the publication on startup
 	// when it does not match the desired Tables list. When Tables is empty
-	// the publication is created `FOR ALL TABLES`; otherwise it is created
+	// the publication is created `FOR ALL TABLES`, otherwise it is created
 	// `FOR TABLE t1, t2, ...`.
 	AutoCreatePub bool
 
@@ -59,7 +59,7 @@ type Config struct {
 	// publication's table list on startup (creating, narrowing, broadening,
 	// or altering as needed). Tables that do not yet exist in Postgres are
 	// dropped from the list with a warning so missing schema doesn't crash
-	// the reader; they'll be picked up the next time the cdc pod restarts
+	// the reader. They'll be picked up the next time the cdc pod restarts
 	// after the migration lands.
 	Tables []string
 
@@ -69,6 +69,14 @@ type Config struct {
 
 	// SlotRetryTimeout caps how long we'll keep retrying StartReplication.
 	SlotRetryTimeout time.Duration
+
+	// OnStatus, when set, is told how each reader cycle went: the error when
+	// a connect, setup, or streaming attempt fails, and nil once WAL streaming
+	// starts. The retry loop never returns these errors (it backs off and
+	// tries again), so without this hook a failure like a missing publication
+	// stays log-only forever. The agent uses it to put replication health on
+	// heartbeats.
+	OnStatus func(err error)
 
 	// Logger is used for structured logging. If nil, slog.Default is used.
 	Logger *slog.Logger
@@ -140,6 +148,7 @@ func (r *reader) start(ctx context.Context, handler Handler) error {
 
 		if err := r.connect(ctx); err != nil {
 			r.logger.Error("connection failed", slog.String("error", err.Error()))
+			r.reportStatus(ctx, err)
 			r.waitWithBackoff(ctx, backoff)
 			backoff = minDuration(backoff*2, r.cfg.MaxReconnectBackoff)
 			continue
@@ -147,6 +156,7 @@ func (r *reader) start(ctx context.Context, handler Handler) error {
 
 		if err := r.setupReplication(ctx); err != nil {
 			r.logger.Error("replication setup failed", slog.String("error", err.Error()))
+			r.reportStatus(ctx, err)
 			r.closeConnection(ctx)
 			r.waitWithBackoff(ctx, backoff)
 			backoff = minDuration(backoff*2, r.cfg.MaxReconnectBackoff)
@@ -156,6 +166,7 @@ func (r *reader) start(ctx context.Context, handler Handler) error {
 		backoff = r.cfg.ReconnectBackoff
 
 		r.logger.Info("WAL streaming started, listening for changes")
+		r.reportStatus(ctx, nil)
 		if err := r.streamLoop(ctx, handler); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -164,6 +175,7 @@ func (r *reader) start(ctx context.Context, handler Handler) error {
 				slog.String("error", err.Error()),
 				slog.Duration("backoff", backoff),
 			)
+			r.reportStatus(ctx, fmt.Errorf("replication stream: %w", err))
 			r.closeConnection(ctx)
 			r.waitWithBackoff(ctx, backoff)
 			backoff = minDuration(backoff*2, r.cfg.MaxReconnectBackoff)
@@ -171,6 +183,18 @@ func (r *reader) start(ctx context.Context, handler Handler) error {
 		}
 		return nil
 	}
+}
+
+// reportStatus forwards a cycle outcome to OnStatus. Failures caused by the
+// caller cancelling ctx are shutdown noise, not health, so they are dropped.
+func (r *reader) reportStatus(ctx context.Context, err error) {
+	if r.cfg.OnStatus == nil {
+		return
+	}
+	if err != nil && ctx.Err() != nil {
+		return
+	}
+	r.cfg.OnStatus(err)
 }
 
 func (r *reader) waitWithBackoff(ctx context.Context, backoff time.Duration) {
@@ -381,15 +405,28 @@ func (r *reader) createPublication(ctx context.Context, forAllTables bool, table
 		)
 	}
 	if _, err := r.conn.Exec(ctx, sql).ReadAll(); err != nil {
-		return fmt.Errorf("create publication: %w", err)
+		return fmt.Errorf("create publication: %w%s", err, publicationPermissionHint(err, sql))
 	}
 	return nil
+}
+
+// publicationPermissionHint turns a bare "permission denied" from publication
+// DDL into an actionable message. Creating or altering a publication needs
+// CREATE on the database plus ownership of every published table, which a
+// least-privilege replication role deliberately lacks, so the fix is a
+// superuser running the statement, and the hint carries it verbatim.
+func publicationPermissionHint(err error, sql string) string {
+	var pgError *pgconn.PgError
+	if !errors.As(err, &pgError) || pgError.Code != "42501" {
+		return ""
+	}
+	return fmt.Sprintf(" (the connecting role cannot manage publications; run this once as a superuser: %s)", sql)
 }
 
 func (r *reader) dropPublication(ctx context.Context) error {
 	sql := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s", r.cfg.PublicationName)
 	if _, err := r.conn.Exec(ctx, sql).ReadAll(); err != nil {
-		return fmt.Errorf("drop publication: %w", err)
+		return fmt.Errorf("drop publication: %w%s", err, publicationPermissionHint(err, sql))
 	}
 	return nil
 }
@@ -418,7 +455,7 @@ func (r *reader) syncPublicationTables(ctx context.Context, desired []string) er
 		slog.Any("to", desired),
 	)
 	if _, err := r.conn.Exec(ctx, sql).ReadAll(); err != nil {
-		return fmt.Errorf("alter publication: %w", err)
+		return fmt.Errorf("alter publication: %w%s", err, publicationPermissionHint(err, sql))
 	}
 	return nil
 }
@@ -459,8 +496,8 @@ func equalStringSets(a, b []string) bool {
 }
 
 // isSafeIdentifier validates that s is a plain SQL identifier we're willing
-// to interpolate into DDL. We don't accept quoting / schemas / dots; tables
-// must live in `public` and follow `[A-Za-z_][A-Za-z0-9_]*`.
+// to interpolate into DDL. We don't accept quoting, schemas, or dots, so
+// tables must live in `public` and follow `[A-Za-z_][A-Za-z0-9_]*`.
 func isSafeIdentifier(s string) bool {
 	if s == "" {
 		return false

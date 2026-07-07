@@ -22,13 +22,25 @@ docker run -d --name foony-sync \
   ghcr.io/foony-limited/foony-sync
 ```
 
-The agent needs a role with `REPLICATION` and SELECT on the tables you watch, and
-`wal_level = logical` on the server:
+The agent needs a role with `REPLICATION` and SELECT on the tables your queries read,
+and `wal_level = logical` on the server:
 
 ```sql
 CREATE ROLE foony_sync REPLICATION LOGIN PASSWORD '...';
-GRANT SELECT ON orders TO foony_sync;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO foony_sync;
 ```
+
+The blanket grant keeps getting started easy. For production, restrict it to only the
+tables your queries read and watch (`GRANT SELECT ON orders TO foony_sync;`) so the
+agent's credential can't read anything else.
+
+The agent also manages a publication named after its key (`foony_sync_<hash>`, printed
+at startup). Creating or altering a publication needs CREATE on the database plus
+ownership of the watched tables, which the role above deliberately lacks. Either grant
+those, or create the publication yourself as a superuser. When the agent can't manage
+it, it reports the exact statement to run in its logs and on the source's dashboard
+card, and it uses a pre-created publication as long as the table list matches its
+config.
 
 See the [Database Sync docs](https://foony.io/docs/database-sync) for the full
 walkthrough: query definitions, watch rules, doc channels, and client subscriptions.
@@ -63,8 +75,8 @@ The definitions file holds the live queries plus two protect-my-database knobs:
 
 The SQL's `$1..$n` placeholders are the query's params. Their values become the doc's
 channel segments in placeholder order, so this query's doc for tenant 42 lives on
-`db:orders:42`. Values bind as text and Postgres casts them from the query's context;
-write an explicit cast like `$1::bigint` when it cannot. A watch's `columns` array
+`db:orders:42`. Values bind as text and Postgres casts them from the query's context.
+Write an explicit cast like `$1::bigint` when it cannot. A watch's `columns` array
 names the changed row's columns that carry those values, in the same order (element i
 feeds `$i+1`). A `keysSql` watch returns one column per param, also in that order.
 

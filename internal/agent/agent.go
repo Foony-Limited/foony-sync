@@ -68,7 +68,7 @@ func Run(ctx context.Context, cfg Config) error {
 
 	syncEngine := engine.New(logger, executor, client, fileConfig.Queries)
 	// The liveness poll doubles as the startup credential check: a 4xx means
-	// a bad or deleted key and is fatal; network trouble retries.
+	// a bad or deleted key and is fatal, while network trouble retries.
 	liveDocs, complete, err := liveDocsWithRetry(ctx, logger, client)
 	if err != nil {
 		return err
@@ -148,7 +148,7 @@ type agentRunner struct {
 	state       string
 	lastError   string
 	lastEventAt *time.Time
-	// detached is set once the WAL safety valve fires; the reader stays down
+	// detached is set once the WAL safety valve fires. The reader stays down
 	// (warm requests and the invalidate API keep working) until restart.
 	detached bool
 	// stopReader asks the reader loop to shut its replication stream (the
@@ -157,11 +157,11 @@ type agentRunner struct {
 }
 
 // runReader keeps the replication stream alive. Each decoded row change feeds
-// the engine; the WAL is acked immediately by the reader's standby loop, so a
-// slow refetch can never balloon WAL retention on the customer database. The
-// flip side is that a crash between the ack and the recompute loses the event
-// from the slot; the startup liveness poll heals that window by marking every
-// live doc dirty (see Engine.SyncLive).
+// the engine, and the WAL is acked immediately by the reader's standby loop,
+// so a slow refetch can never balloon WAL retention on the customer database.
+// The flip side is that a crash between the ack and the recompute loses the
+// event from the slot. The startup liveness poll heals that window by marking
+// every live doc dirty (see Engine.SyncLive).
 func (runner *agentRunner) runReader(ctx context.Context) {
 	runner.mutex.Lock()
 	runner.stopReader = make(chan struct{}, 1)
@@ -189,6 +189,17 @@ func (runner *agentRunner) runReader(ctx context.Context) {
 			AutoCreatePub:   true,
 			Tables:          tables,
 			Logger:          runner.logger,
+			// The reader retries setup failures internally and never returns
+			// them, so this hook is the only way problems like a missing
+			// publication or a permission error reach heartbeats (and the
+			// dashboard). A nil status means streaming (re)started.
+			OnStatus: func(statusErr error) {
+				if statusErr != nil {
+					runner.setError(statusErr)
+					return
+				}
+				runner.clearError()
+			},
 		}, func(ctx context.Context, event cdc.Event) error {
 			now := time.Now()
 			runner.mutex.Lock()
@@ -269,10 +280,10 @@ func (runner *agentRunner) measureSlotLag(ctx context.Context) int64 {
 
 // detach is the safety valve: stop replicating and drop the slot so the
 // customer database stops retaining WAL for us. Warm requests keep working,
-// so subscribers still get docs computed on demand; only change-driven
+// so subscribers still get docs computed on demand. Only change-driven
 // freshness is lost until the agent restarts.
 func (runner *agentRunner) detach(ctx context.Context, slotLag int64) {
-	runner.logger.Error("WAL retention cap exceeded; dropping the replication slot to protect the database",
+	runner.logger.Error("WAL retention cap exceeded, dropping the replication slot to protect the database",
 		"slotLagBytes", slotLag,
 		"capBytes", runner.settings.walRetentionCapBytes)
 	runner.mutex.Lock()
@@ -300,9 +311,26 @@ func (runner *agentRunner) isDetached() bool {
 
 func (runner *agentRunner) setError(err error) {
 	runner.mutex.Lock()
+	defer runner.mutex.Unlock()
+	if runner.detached {
+		// Detached is terminal until restart, so a later stream error must
+		// not overwrite the safety-valve message on the dashboard.
+		return
+	}
 	runner.state = "degraded"
 	runner.lastError = err.Error()
-	runner.mutex.Unlock()
+}
+
+// clearError flips the source back to connected once replication streams
+// again, so a past failure doesn't read as current on the dashboard.
+func (runner *agentRunner) clearError() {
+	runner.mutex.Lock()
+	defer runner.mutex.Unlock()
+	if runner.detached {
+		return
+	}
+	runner.state = "connected"
+	runner.lastError = ""
 }
 
 // liveDocsWithRetry fetches the startup liveness poll, retrying transient
@@ -329,8 +357,8 @@ func liveDocsWithRetry(ctx context.Context, logger *slog.Logger, client *FoonyCl
 }
 
 // slotNameFor derives a Postgres-safe replication slot and publication name
-// from the agent key's public id (stable per source; key ids are base64url,
-// which slot names cannot carry, hence the hex digest).
+// from the agent key's public id, which is stable per source. Key ids are
+// base64url, which slot names cannot carry, hence the hex digest.
 func slotNameFor(keyID string) string {
 	digest := sha256.Sum256([]byte(keyID))
 	return "foony_sync_" + hex.EncodeToString(digest[:8])
