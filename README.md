@@ -88,8 +88,32 @@ go build .          # or: go install github.com/Foony-Limited/foony-sync@latest
 go test ./...
 ```
 
-The published image is built by [release-image.yml](.github/workflows/release-image.yml)
-on every version tag and pushed to `ghcr.io/foony-limited/foony-sync`.
+## Cutting a release
+
+Releases are version tags. With `main` green:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+[release-image.yml](.github/workflows/release-image.yml) then builds the image for
+linux/amd64 and linux/arm64 and pushes `ghcr.io/foony-limited/foony-sync:0.2.0` plus
+`:latest`. The tag's version (without the `v`) is stamped into the binary and shows up
+in dashboard heartbeats as the agent version.
+
+Before tagging, check whether [realtime-go](https://github.com/Foony-Limited/realtime-go)
+has shipped a release the agent should pick up:
+
+```bash
+go get github.com/Foony-Limited/realtime-go@latest && go mod tidy
+```
+
+Verify a release with an anonymous pull once the workflow finishes:
+
+```bash
+docker pull ghcr.io/foony-limited/foony-sync:0.2.0
+```
 
 ## License
 
