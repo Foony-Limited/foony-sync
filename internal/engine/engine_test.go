@@ -17,7 +17,7 @@ type fakeRunner struct {
 	mutex    sync.Mutex
 	docCalls []string
 	docArgs  [][]any
-	keysRows []map[string]any
+	keysRows [][]any
 	docErr   error
 	keysErr  error
 }
@@ -33,7 +33,7 @@ func (runner *fakeRunner) RunDoc(ctx context.Context, sql string, args []any) (j
 	return json.RawMessage(`{"ok":true}`), nil
 }
 
-func (runner *fakeRunner) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([]map[string]any, error) {
+func (runner *fakeRunner) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([][]any, error) {
 	runner.mutex.Lock()
 	defer runner.mutex.Unlock()
 	if runner.keysErr != nil {
@@ -88,11 +88,10 @@ func (publisher *fakePublisher) waitFor(t *testing.T, channel string) {
 
 func ordersQuery() spec.Query {
 	return spec.Query{
-		Name:   "orders",
-		SQL:    "SELECT 1",
-		Params: []spec.Param{{Name: "tenantId", Type: "text"}},
+		Name: "orders",
+		SQL:  "SELECT to_json($1::text)",
 		Watches: []spec.Watch{
-			{Table: "orders", Columns: map[string]string{"tenantId": "tenant_id"}},
+			{Table: "orders", Columns: []string{"tenant_id"}},
 		},
 	}
 }
@@ -200,9 +199,9 @@ func TestKeysSQLWatchFansOutToReturnedKeys(t *testing.T) {
 		KeysSQL:     "SELECT tenant_id FROM x WHERE user_id = $1",
 		KeysColumns: map[string]string{"$1": "id"},
 	})
-	runner := &fakeRunner{keysRows: []map[string]any{
-		{"tenantId": "t1"},
-		{"tenantId": "t2"},
+	runner := &fakeRunner{keysRows: [][]any{
+		{"t1"},
+		{"t2"},
 	}}
 	publisher := newFakePublisher()
 	testEngine := startEngine(t, runner, publisher, query)
@@ -359,7 +358,7 @@ func TestKeysQueryFailureRetriesTheLookup(t *testing.T) {
 	}}
 	runner := &fakeRunner{
 		keysErr:  fmt.Errorf("connection refused"),
-		keysRows: []map[string]any{{"tenantId": "t1"}},
+		keysRows: [][]any{{"t1"}},
 	}
 	publisher := newFakePublisher()
 	testEngine := New(slog.Default(), runner, publisher, []spec.Query{query})
@@ -418,17 +417,46 @@ func TestChannelValueRejectsUnkeyableValues(t *testing.T) {
 	}
 }
 
-func TestTypedArgsConvertsPerDeclaredType(t *testing.T) {
+func TestKeysRowWidthMustMatchParamCount(t *testing.T) {
 	t.Parallel()
-	params := []spec.Param{{Name: "a", Type: "int"}, {Name: "b", Type: "bool"}, {Name: "c", Type: "text"}}
-	args, err := typedArgs(params, []string{"7", "true", "x"})
-	if err != nil {
-		t.Fatalf("typedArgs() error = %v", err)
+	query := ordersQuery()
+	query.Watches = []spec.Watch{{
+		Table:       "users",
+		KeysSQL:     "SELECT tenant_id, extra FROM x WHERE user_id = $1",
+		KeysColumns: map[string]string{"$1": "id"},
+	}}
+	runner := &fakeRunner{keysRows: [][]any{{"t1", "oops"}}}
+	publisher := newFakePublisher()
+	testEngine := startEngine(t, runner, publisher, query)
+	markLive(testEngine, "db:orders:t1")
+
+	testEngine.HandleEvent(Event{
+		Table:   "public.users",
+		NewData: map[string]any{"id": "u1"},
+	})
+	time.Sleep(50 * time.Millisecond)
+	publisher.mutex.Lock()
+	defer publisher.mutex.Unlock()
+	if len(publisher.published) != 0 {
+		t.Fatalf("a keysSql row with the wrong width must not key a doc: %v", publisher.published)
 	}
-	if args[0] != int64(7) || args[1] != true || args[2] != "x" {
-		t.Fatalf("typedArgs() = %v", args)
+}
+
+func TestBareWatchDirtiesAParamLessQuery(t *testing.T) {
+	t.Parallel()
+	query := spec.Query{
+		Name:    "stats",
+		SQL:     "SELECT json_build_object('total', count(*)) FROM orders",
+		Watches: []spec.Watch{{Table: "orders"}},
 	}
-	if _, err := typedArgs(params, []string{"seven", "true", "x"}); err == nil {
-		t.Fatal("typedArgs should reject a non-int value for an int param")
-	}
+	runner := &fakeRunner{}
+	publisher := newFakePublisher()
+	testEngine := startEngine(t, runner, publisher, query)
+	markLive(testEngine, "db:stats")
+
+	testEngine.HandleEvent(Event{
+		Table:   "public.orders",
+		NewData: map[string]any{"anything": "x"},
+	})
+	publisher.waitFor(t, "db:stats")
 }

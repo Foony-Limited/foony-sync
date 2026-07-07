@@ -47,7 +47,9 @@ type Publisher interface {
 // Runner executes customer SQL: the doc query and keysSql reverse indexes.
 type Runner interface {
 	RunDoc(ctx context.Context, sql string, args []any) (json.RawMessage, error)
-	RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([]map[string]any, error)
+	// RunKeys returns each result row's values in column order (column i is
+	// the value for param $i+1).
+	RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([][]any, error)
 }
 
 // Event is one row change from the replication stream, reduced to what the
@@ -65,10 +67,11 @@ type Engine struct {
 	runner    Runner
 	publisher Publisher
 
-	// queries by name, and watches indexed by fully qualified table name.
-	// Both are immutable after New: definitions come from the local config
-	// file, loaded once at startup.
-	queries map[string]spec.Query
+	// queries by name (with each query's param count precomputed from its
+	// SQL), and watches indexed by fully qualified table name. Both are
+	// immutable after New: definitions come from the local config file,
+	// loaded once at startup.
+	queries map[string]queryDef
 	watches map[string][]watchRef
 
 	mutex sync.Mutex
@@ -102,9 +105,16 @@ type watchRef struct {
 	watch     spec.Watch
 }
 
+// queryDef is a definition plus its param count, resolved once at New so the
+// hot paths never re-scan the SQL.
+type queryDef struct {
+	spec.Query
+	arity int
+}
+
 // pendingLookup is one deduped keysSql invocation waiting for a worker.
 type pendingLookup struct {
-	query spec.Query
+	query queryDef
 	watch spec.Watch
 	args  []any
 }
@@ -112,10 +122,10 @@ type pendingLookup struct {
 // New returns an engine over the supplied definitions. Start launches the
 // workers.
 func New(logger *slog.Logger, runner Runner, publisher Publisher, definitions []spec.Query) *Engine {
-	queries := make(map[string]spec.Query, len(definitions))
+	queries := make(map[string]queryDef, len(definitions))
 	watches := map[string][]watchRef{}
 	for _, query := range definitions {
-		queries[query.Name] = query
+		queries[query.Name] = queryDef{Query: query, arity: spec.ParamCount(query.SQL)}
 		for _, watch := range query.Watches {
 			table := qualifiedTable(watch.Table)
 			watches[table] = append(watches[table], watchRef{queryName: query.Name, watch: watch})
@@ -258,6 +268,11 @@ func (engine *Engine) HandleEvent(event Event) {
 			engine.markFromRow(query, ref.watch, event.NewData)
 			continue
 		}
+		if strings.TrimSpace(ref.watch.KeysSQL) == "" {
+			// A watch on a param-less query: any change dirties its only doc.
+			engine.markDirty(BuildChannel(query.Name, nil))
+			continue
+		}
 		engine.enqueueLookup(query, ref.watch, event)
 	}
 }
@@ -324,10 +339,11 @@ func (engine *Engine) compute(ctx context.Context, channel string) {
 	if err != nil {
 		return
 	}
-	args, err := typedArgs(query.Params, values)
-	if err != nil {
-		engine.logger.Warn("doc params failed to convert", "channel", channel, "error", err.Error())
-		return
+	// Segments bind as text; Postgres casts them from the query's context
+	// (pgx encodes Go strings into whatever type each param needs).
+	args := make([]any, len(values))
+	for index, value := range values {
+		args[index] = value
 	}
 	doc, err := engine.runner.RunDoc(ctx, query.SQL, args)
 	if err != nil {
@@ -349,19 +365,20 @@ func (engine *Engine) compute(ctx context.Context, channel string) {
 }
 
 // markFromRow derives one doc key from a changed row via the direct column
-// mapping and marks it dirty. Rows missing a mapped column (e.g. a DELETE's
-// replica-identity-only old row) derive nothing.
-func (engine *Engine) markFromRow(query spec.Query, watch spec.Watch, row map[string]any) {
+// mapping (element i of columns feeds channel segment i) and marks it dirty.
+// Rows missing a mapped column (e.g. a DELETE's replica-identity-only old
+// row) derive nothing.
+func (engine *Engine) markFromRow(query queryDef, watch spec.Watch, row map[string]any) {
 	if row == nil {
 		return
 	}
-	values := make([]string, len(query.Params))
-	for index, param := range query.Params {
-		column, ok := watch.Columns[param.Name]
+	values := make([]string, len(watch.Columns))
+	for index, column := range watch.Columns {
+		raw, ok := row[column]
 		if !ok {
 			return
 		}
-		value, ok := channelValue(row[column])
+		value, ok := channelValue(raw)
 		if !ok {
 			engine.noteSkippedValue(query.Name)
 			return
@@ -375,7 +392,7 @@ func (engine *Engine) markFromRow(query spec.Query, watch spec.Watch, row map[st
 // queues one keysSql run for the workers. Inputs come from the new row,
 // falling back to the old (deletes only carry old data). The dedup key means
 // a hot row changed a thousand times costs one lookup, not a thousand.
-func (engine *Engine) enqueueLookup(query spec.Query, watch spec.Watch, event Event) {
+func (engine *Engine) enqueueLookup(query queryDef, watch spec.Watch, event Event) {
 	row := event.NewData
 	if row == nil {
 		row = event.OldData
@@ -438,10 +455,16 @@ func (engine *Engine) runLookup(ctx context.Context, key string, lookup pendingL
 		return
 	}
 	for _, keyRow := range rows {
-		values := make([]string, len(lookup.query.Params))
+		if len(keyRow) != lookup.query.arity {
+			engine.logger.Warn("keysSql must return one column per query param, in param order",
+				"query", lookup.query.Name, "table", lookup.watch.Table,
+				"columns", len(keyRow), "params", lookup.query.arity)
+			return
+		}
+		values := make([]string, len(keyRow))
 		complete := true
-		for index, param := range lookup.query.Params {
-			value, ok := channelValue(keyRow[param.Name])
+		for index, raw := range keyRow {
+			value, ok := channelValue(raw)
 			if !ok {
 				engine.noteSkippedValue(lookup.query.Name)
 				complete = false
@@ -506,22 +529,22 @@ func (engine *Engine) noteSkippedValue(queryName string) {
 }
 
 // parseChannel resolves a db: channel to its query and raw param values.
-func (engine *Engine) parseChannel(channel string) (spec.Query, []string, error) {
+func (engine *Engine) parseChannel(channel string) (queryDef, []string, error) {
 	if !spec.IsSyncDocChannel(channel) {
-		return spec.Query{}, nil, fmt.Errorf("not a db: channel: %s", channel)
+		return queryDef{}, nil, fmt.Errorf("not a db: channel: %s", channel)
 	}
 	segments := strings.Split(channel[len(spec.SyncDocPrefix):], ":")
 	query, ok := engine.queries[segments[0]]
 	if !ok {
-		return spec.Query{}, nil, fmt.Errorf("unknown query %q", segments[0])
+		return queryDef{}, nil, fmt.Errorf("unknown query %q", segments[0])
 	}
 	values := segments[1:]
-	if len(values) != len(query.Params) {
-		return spec.Query{}, nil, fmt.Errorf("channel %s has %d params, query %s declares %d", channel, len(values), query.Name, len(query.Params))
+	if len(values) != query.arity {
+		return queryDef{}, nil, fmt.Errorf("channel %s has %d params, query %s uses %d", channel, len(values), query.Name, query.arity)
 	}
 	for _, value := range values {
 		if !spec.ValidChannelValue(value) {
-			return spec.Query{}, nil, fmt.Errorf("channel %s has an invalid param segment", channel)
+			return queryDef{}, nil, fmt.Errorf("channel %s has an invalid param segment", channel)
 		}
 	}
 	return query, values, nil
@@ -540,35 +563,6 @@ func BuildChannel(queryName string, values []string) string {
 		return spec.SyncDocPrefix + queryName
 	}
 	return spec.SyncDocPrefix + queryName + ":" + strings.Join(values, ":")
-}
-
-// typedArgs converts channel segments back to SQL arguments per the declared
-// param types, so `WHERE id = $1` matches an int column and not a string.
-func typedArgs(params []spec.Param, values []string) ([]any, error) {
-	args := make([]any, len(values))
-	for index, param := range params {
-		value := values[index]
-		switch param.Type {
-		case "int":
-			number, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("param %s: %q is not an int", param.Name, value)
-			}
-			args[index] = number
-		case "bool":
-			switch value {
-			case "true":
-				args[index] = true
-			case "false":
-				args[index] = false
-			default:
-				return nil, fmt.Errorf("param %s: %q is not a bool", param.Name, value)
-			}
-		default:
-			args[index] = value
-		}
-	}
-	return args, nil
 }
 
 // channelValue renders a row value as a channel segment. Unsupported types or

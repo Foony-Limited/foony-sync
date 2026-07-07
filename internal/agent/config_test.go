@@ -23,8 +23,7 @@ func TestLoadConfigAcceptsAValidFile(t *testing.T) {
 		"queries": [{
 			"name": "orders",
 			"sql": "SELECT coalesce(json_agg(o.*), '[]') FROM orders o WHERE o.tenant_id = $1",
-			"params": [{"name": "tenantId", "type": "text"}],
-			"watches": [{"table": "orders", "columns": {"tenantId": "tenant_id"}}]
+			"watches": [{"table": "orders", "columns": ["tenant_id"]}]
 		}],
 		"statementTimeoutMs": 2000
 	}`)
@@ -53,6 +52,8 @@ func TestLoadConfigRejections(t *testing.T) {
 		want    string
 	}{
 		{"no queries", `{"queries": []}`, "declares no queries"},
+		{"v0.1 params block gets the migration hint", `{"queries": [{"name": "a", "sql": "SELECT $1", "params": [{"name": "x", "type": "text"}], "watches": []}]}`, "since v0.2"},
+		{"v0.1 columns map gets the migration hint", `{"queries": [{"name": "a", "sql": "SELECT $1", "watches": [{"table": "t", "columns": {"x": "x_col"}}]}]}`, "since v0.2"},
 		{"unknown field", `{"queries": [{"name": "a", "sql": "SELECT 1"}], "settings": {}}`, "unknown field"},
 		{"invalid query", `{"queries": [{"name": "BAD NAME", "sql": "SELECT 1"}]}`, "name must be"},
 		{"duplicate query", `{"queries": [{"name": "a", "sql": "SELECT 1"}, {"name": "a", "sql": "SELECT 2"}]}`, "declared twice"},

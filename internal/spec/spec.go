@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -27,25 +28,19 @@ const (
 	MaxParamValueLength = 64
 )
 
-// Param is one declared query parameter. Values become channel-name segments,
-// so types are restricted to values that fit the channel charset.
-type Param struct {
-	Name string `json:"name"`
-	// Type is text, int, uuid, or bool.
-	Type string `json:"type"`
-}
-
 // Watch maps changes on one customer table to affected doc keys. Exactly one
 // of Columns or KeysSQL must be set: Columns reads param values straight off
 // the changed row; KeysSQL is the reverse index for join queries, run against
 // the customer database with values from the changed row to return one row
-// per affected params-tuple.
+// per affected doc.
 type Watch struct {
 	Table string `json:"table"`
-	// Columns maps param name to the column of Table that carries its value.
-	Columns map[string]string `json:"columns,omitempty"`
+	// Columns names the changed row's columns that carry the query's param
+	// values, in order: element i feeds $i+1 and channel segment i+1. Must
+	// have exactly one column per query param.
+	Columns []string `json:"columns,omitempty"`
 	// KeysSQL is a single-statement SELECT returning one column per query
-	// param, aliased to the param names, one row per affected doc.
+	// param, in param order, one row per affected doc.
 	KeysSQL string `json:"keysSql,omitempty"`
 	// KeysColumns maps KeysSQL placeholders ($1..$n) to columns of the changed
 	// row that feed them.
@@ -55,13 +50,15 @@ type Watch struct {
 }
 
 // Query is one live-query definition: the doc SQL plus the watches that keep
-// its docs fresh. Docs live on the channel db:<Name>:<param values>.
+// its docs fresh. The SQL's $1..$n placeholders are the query's params; their
+// values become the channel segments, in placeholder order, so a doc lives on
+// db:<Name>:<$1 value>:...:<$n value>. Values bind as text and Postgres casts
+// them from context (write an explicit cast like $1::bigint when it cannot).
 // Definitions live in the agent's local config file and never leave it; the
 // server only ever sees the Summary.
 type Query struct {
 	Name    string  `json:"name"`
 	SQL     string  `json:"sql"`
-	Params  []Param `json:"params"`
 	Watches []Watch `json:"watches"`
 }
 
@@ -93,11 +90,21 @@ var (
 	tablePattern        = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	channelValuePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	placeholderPattern  = regexp.MustCompile(`^\$[1-9][0-9]?$`)
+	paramRefPattern     = regexp.MustCompile(`\$([0-9]+)`)
 )
 
-// ValidParamType reports whether t is a supported param type.
-func ValidParamType(t string) bool {
-	return t == "text" || t == "int" || t == "uuid" || t == "bool"
+// ParamCount reports how many params a query's SQL uses: the highest $n
+// placeholder it references. A $n inside a string literal counts too, a
+// deliberate simplification (it can only over-count, which fails watch
+// validation loudly at load rather than mis-keying docs at runtime).
+func ParamCount(sql string) int {
+	highest := 0
+	for _, match := range paramRefPattern.FindAllStringSubmatch(sql, -1) {
+		if n, err := strconv.Atoi(match[1]); err == nil && n > highest {
+			highest = n
+		}
+	}
+	return highest
 }
 
 // ValidChannelValue reports whether value may appear as a param segment of a
@@ -117,54 +124,47 @@ func Validate(query Query) error {
 	if err := validateSelect(query.SQL, "sql"); err != nil {
 		return err
 	}
-	if len(query.Params) > MaxParamsPerQuery {
-		return fmt.Errorf("a query may declare at most %d params", MaxParamsPerQuery)
-	}
-	paramNames := make(map[string]bool, len(query.Params))
-	for _, param := range query.Params {
-		if !identifierPattern.MatchString(param.Name) {
-			return fmt.Errorf("param name %q must be a plain identifier", param.Name)
-		}
-		if !ValidParamType(param.Type) {
-			return fmt.Errorf("param %q type must be text, int, uuid, or bool", param.Name)
-		}
-		if paramNames[param.Name] {
-			return fmt.Errorf("param %q is declared twice", param.Name)
-		}
-		paramNames[param.Name] = true
+	arity := ParamCount(query.SQL)
+	if arity > MaxParamsPerQuery {
+		return fmt.Errorf("a query may use at most %d params ($1..$%d)", MaxParamsPerQuery, MaxParamsPerQuery)
 	}
 	if len(query.Watches) > MaxWatchesPerQuery {
 		return fmt.Errorf("a query may declare at most %d watches", MaxWatchesPerQuery)
 	}
 	for index, watch := range query.Watches {
-		if err := validateWatch(watch, paramNames); err != nil {
+		if err := validateWatch(watch, arity); err != nil {
 			return fmt.Errorf("watch %d (%s): %w", index+1, watch.Table, err)
 		}
 	}
 	return nil
 }
 
-func validateWatch(watch Watch, paramNames map[string]bool) error {
+func validateWatch(watch Watch, arity int) error {
 	if !tablePattern.MatchString(watch.Table) {
 		return errors.New("table must be a plain identifier in the public schema")
 	}
 	hasColumns := len(watch.Columns) > 0
 	hasKeysSQL := strings.TrimSpace(watch.KeysSQL) != ""
-	if hasColumns == hasKeysSQL {
+	if hasColumns == hasKeysSQL && arity > 0 {
 		return errors.New("declare exactly one of columns (direct mapping) or keysSql (reverse index)")
 	}
 	if hasColumns {
 		if watch.MaxKeys != 0 || len(watch.KeysColumns) > 0 {
 			return errors.New("maxKeys and keysColumns only apply to keysSql watches")
 		}
-		for param, column := range watch.Columns {
-			if !paramNames[param] {
-				return fmt.Errorf("columns maps unknown param %q", param)
-			}
+		if len(watch.Columns) != arity {
+			return fmt.Errorf("columns lists %d columns but the sql uses %d params (element i feeds $i+1)", len(watch.Columns), arity)
+		}
+		for _, column := range watch.Columns {
 			if !identifierPattern.MatchString(column) {
 				return fmt.Errorf("column %q must be a plain identifier", column)
 			}
 		}
+		return nil
+	}
+	if !hasKeysSQL {
+		// A watch on a param-less query needs no mapping: any change on the
+		// table dirties the query's only doc.
 		return nil
 	}
 	if err := validateSelect(watch.KeysSQL, "keysSql"); err != nil {

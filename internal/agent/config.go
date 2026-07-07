@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Foony-Limited/foony-sync/internal/spec"
@@ -51,6 +52,11 @@ func LoadConfig(path string) (FileConfig, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
+		// v0.2 dropped the params block and made watch columns an ordered
+		// array; point upgraders at the change instead of a bare decode error.
+		if strings.Contains(err.Error(), `"params"`) || strings.Contains(err.Error(), "columns of type []string") {
+			return FileConfig{}, fmt.Errorf("dbsync: parse config %s: %w (since v0.2 the sql's $1..$n placeholders are the params: delete the params block and write watch columns as an ordered array like [\"tenant_id\"]; see the README)", path, err)
+		}
 		return FileConfig{}, fmt.Errorf("dbsync: parse config %s: %w", path, err)
 	}
 	if len(config.Queries) == 0 {

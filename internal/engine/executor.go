@@ -104,18 +104,18 @@ func (executor *Executor) RunDoc(ctx context.Context, sql string, args []any) (j
 	return doc, nil
 }
 
-// RunKeys executes a keysSql reverse index and returns up to maxKeys rows as
-// column-name keyed maps. Hitting the cap is an error by design: a truncated
-// key set would silently leave some docs stale, so the customer must tighten
-// the query or raise maxKeys instead.
-func (executor *Executor) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([]map[string]any, error) {
+// RunKeys executes a keysSql reverse index and returns up to maxKeys rows,
+// each row's values in column order (column i feeds query param $i+1).
+// Hitting the cap is an error by design: a truncated key set would silently
+// leave some docs stale, so the customer must tighten the query or raise
+// maxKeys instead.
+func (executor *Executor) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([][]any, error) {
 	rows, err := executor.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, fmt.Errorf("dbsync: keys query: %w", err)
 	}
 	defer rows.Close()
-	fields := rows.FieldDescriptions()
-	results := []map[string]any{}
+	results := [][]any{}
 	for rows.Next() {
 		if len(results) >= maxKeys {
 			return nil, fmt.Errorf("dbsync: keys query returned more than maxKeys (%d) rows", maxKeys)
@@ -124,11 +124,7 @@ func (executor *Executor) RunKeys(ctx context.Context, sql string, args []any, m
 		if err != nil {
 			return nil, fmt.Errorf("dbsync: keys scan: %w", err)
 		}
-		row := make(map[string]any, len(fields))
-		for index, field := range fields {
-			row[field.Name] = values[index]
-		}
-		results = append(results, row)
+		results = append(results, values)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("dbsync: keys query: %w", err)

@@ -52,15 +52,21 @@ The definitions file holds the live queries plus two protect-my-database knobs:
   "queries": [{
     "name": "orders",
     "sql": "SELECT coalesce(json_agg(o.* ORDER BY o.created_at DESC), '[]') FROM orders o WHERE o.tenant_id = $1 AND o.status = 'open'",
-    "params": [{ "name": "tenantId", "type": "text" }],
     "watches": [
-      { "table": "orders", "columns": { "tenantId": "tenant_id" } }
+      { "table": "orders", "columns": ["tenant_id"] }
     ]
   }],
   "statementTimeoutMs": 5000,
   "walRetentionCapBytes": 4294967296
 }
 ```
+
+The SQL's `$1..$n` placeholders are the query's params. Their values become the doc's
+channel segments in placeholder order, so this query's doc for tenant 42 lives on
+`db:orders:42`. Values bind as text and Postgres casts them from the query's context;
+write an explicit cast like `$1::bigint` when it cannot. A watch's `columns` array
+names the changed row's columns that carry those values, in the same order (element i
+feeds `$i+1`). A `keysSql` watch returns one column per param, also in that order.
 
 - `statementTimeoutMs` pins every query the agent runs (default 5000).
 - `walRetentionCapBytes` is the safety valve: past this much retained WAL the agent
