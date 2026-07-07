@@ -380,7 +380,7 @@ func (engine *Engine) markFromRow(query queryDef, watch spec.Watch, row map[stri
 		}
 		value, ok := channelValue(raw)
 		if !ok {
-			engine.noteSkippedValue(query.Name)
+			engine.noteSkippedValue(query.Name, value)
 			return
 		}
 		values[index] = value
@@ -466,7 +466,7 @@ func (engine *Engine) runLookup(ctx context.Context, key string, lookup pendingL
 		for index, raw := range keyRow {
 			value, ok := channelValue(raw)
 			if !ok {
-				engine.noteSkippedValue(lookup.query.Name)
+				engine.noteSkippedValue(lookup.query.Name, value)
 				complete = false
 				break
 			}
@@ -515,7 +515,11 @@ func (engine *Engine) signal() {
 	}
 }
 
-func (engine *Engine) noteSkippedValue(queryName string) {
+// noteSkippedValue counts a doc-key value that cannot become a channel
+// segment and logs it, value included: the log runs on the customer's own
+// infrastructure, so showing their data costs nothing and finding the
+// offending rows would otherwise mean guesswork.
+func (engine *Engine) noteSkippedValue(queryName, value string) {
 	engine.mutex.Lock()
 	engine.skippedValues++
 	skipped := engine.skippedValues
@@ -523,10 +527,17 @@ func (engine *Engine) noteSkippedValue(queryName string) {
 	// Log the first few and then sample, so a high-churn mismatch does not
 	// flood the agent's output.
 	if skipped <= 5 || skipped%1000 == 0 {
+		if len(value) > maxLoggedValueBytes {
+			value = value[:maxLoggedValueBytes] + "..."
+		}
 		engine.logger.Warn("param value cannot become a channel segment (allowed: A-Za-z0-9_- up to 64 bytes)",
-			"query", queryName, "total", skipped)
+			"query", queryName, "value", value, "total", skipped)
 	}
 }
+
+// maxLoggedValueBytes caps a skipped value in the log so a mapped blob or
+// JSON column cannot dump kilobytes into one line.
+const maxLoggedValueBytes = 100
 
 // parseChannel resolves a db: channel to its query and raw param values.
 func (engine *Engine) parseChannel(channel string) (queryDef, []string, error) {
@@ -566,7 +577,9 @@ func BuildChannel(queryName string, values []string) string {
 }
 
 // channelValue renders a row value as a channel segment. Unsupported types or
-// values outside the channel charset yield ok=false and the doc is skipped.
+// values outside the channel charset yield ok=false and the doc is skipped,
+// but the derived text still comes back so the skipped-value log can show
+// what was rejected (nil is the exception and returns empty text).
 func channelValue(value any) (string, bool) {
 	var text string
 	switch typed := value.(type) {
@@ -583,16 +596,17 @@ func channelValue(value any) (string, bool) {
 	case int:
 		text = strconv.Itoa(typed)
 	case float64:
-		// pgoutput decodes numerics as strings; a float here means a customer
-		// mapped a float column, which cannot be a stable key.
-		return "", false
+		// pgoutput decodes numerics as strings, so a float here means a
+		// customer mapped a float column, which cannot be a stable key. The
+		// text form still comes back for the skipped-value log.
+		return strconv.FormatFloat(typed, 'g', -1, 64), false
 	case [16]byte:
 		text = formatUUID(typed)
 	default:
 		text = fmt.Sprintf("%v", typed)
 	}
 	if !spec.ValidChannelValue(text) {
-		return "", false
+		return text, false
 	}
 	return text, true
 }

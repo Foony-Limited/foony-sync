@@ -405,11 +405,13 @@ func TestChannelValueRejectsUnkeyableValues(t *testing.T) {
 	if _, ok := channelValue(nil); ok {
 		t.Fatal("nil should not become a channel segment")
 	}
-	if _, ok := channelValue("has space"); ok {
-		t.Fatal("invalid charset should not become a channel segment")
+	// Rejected values still return their text form so the skipped-value log
+	// can show what was rejected.
+	if value, ok := channelValue("has space"); ok || value != "has space" {
+		t.Fatalf("channelValue(\"has space\") = %q, %v", value, ok)
 	}
-	if _, ok := channelValue(1.5); ok {
-		t.Fatal("floats should not become channel segments")
+	if value, ok := channelValue(1.5); ok || value != "1.5" {
+		t.Fatalf("channelValue(1.5) = %q, %v", value, ok)
 	}
 	value, ok := channelValue(int64(42))
 	if !ok || value != "42" {
