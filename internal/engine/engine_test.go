@@ -428,21 +428,33 @@ func TestKeysQueryFailureRetriesTheLookup(t *testing.T) {
 	publisher.waitFor(t, "db:orders:t1")
 }
 
-func TestPublishFailureRetriesTheDoc(t *testing.T) {
+func TestPublishFailureRetriesTheDocPaced(t *testing.T) {
 	t.Parallel()
 	runner := &fakeRunner{}
 	publisher := newFakePublisher()
 	publisher.err = fmt.Errorf("foony unreachable")
-	testEngine := startEngine(t, runner, publisher, ordersQuery())
+	testEngine := New(slog.Default(), runner, publisher, []spec.Query{ordersQuery()})
+	testEngine.retryDelay = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	testEngine.Start(ctx)
 
 	testEngine.Warm("db:orders:tenant42")
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 	publisher.mutex.Lock()
 	publisher.err = nil
 	publisher.mutex.Unlock()
-	// The failed publish left the doc dirty; any wake recomputes it.
-	testEngine.Warm("db:orders:tenant42")
+	// The failed publish re-dirties the doc through the retry pause, so it
+	// republishes on its own once foony is reachable again.
 	publisher.waitFor(t, "db:orders:tenant42")
+	// The retries must be paced by retryDelay, not a hot loop: an immediate
+	// re-dirty would recompute thousands of times in the 50ms window.
+	runner.mutex.Lock()
+	docCalls := len(runner.docCalls)
+	runner.mutex.Unlock()
+	if docCalls > 30 {
+		t.Fatalf("doc recomputed %d times during a 50ms outage, retries are not paced", docCalls)
+	}
 }
 
 func TestChannelValueRejectsUnkeyableValues(t *testing.T) {

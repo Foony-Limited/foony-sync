@@ -359,9 +359,11 @@ func (engine *Engine) compute(ctx context.Context, channel string) {
 		engine.logger.Warn("doc publish failed", "channel", channel, "error", err.Error())
 		// Publish failures re-dirty the doc so it retries once foony is
 		// reachable again, instead of staying stale until the next change.
-		engine.mutex.Lock()
-		engine.dirty[channel] = struct{}{}
-		engine.mutex.Unlock()
+		// Through retryLater like a query failure: an immediate re-dirty
+		// wakes a worker right back into the same failing publish, a hot
+		// loop that recomputes docs against the customer's database for as
+		// long as foony is unreachable.
+		engine.retryLater(ctx, func() { engine.markDirty(channel) })
 	}
 }
 
