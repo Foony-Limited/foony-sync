@@ -299,7 +299,7 @@ func (runner *agentRunner) detach(ctx context.Context, slotLag int64) {
 	}
 	time.Sleep(2 * time.Second)
 	if _, err := runner.executor.Pool().Exec(ctx, "SELECT pg_drop_replication_slot($1)", runner.slotName); err != nil {
-		runner.logger.Error("dropping the replication slot failed; drop it manually", "slot", runner.slotName, "error", err.Error())
+		runner.logger.Error("dropping the replication slot failed, drop it manually with SELECT pg_drop_replication_slot", "slot", runner.slotName, "error", err.Error())
 	}
 }
 

@@ -14,12 +14,13 @@ import (
 
 // fakeRunner records executed SQL and serves canned results.
 type fakeRunner struct {
-	mutex    sync.Mutex
-	docCalls []string
-	docArgs  [][]any
-	keysRows [][]any
-	docErr   error
-	keysErr  error
+	mutex     sync.Mutex
+	docCalls  []string
+	docArgs   [][]any
+	keysRows  [][]any
+	keysCalls int
+	docErr    error
+	keysErr   error
 }
 
 func (runner *fakeRunner) RunDoc(ctx context.Context, sql string, args []any) (json.RawMessage, error) {
@@ -36,6 +37,7 @@ func (runner *fakeRunner) RunDoc(ctx context.Context, sql string, args []any) (j
 func (runner *fakeRunner) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([][]any, error) {
 	runner.mutex.Lock()
 	defer runner.mutex.Unlock()
+	runner.keysCalls++
 	if runner.keysErr != nil {
 		return nil, runner.keysErr
 	}
@@ -213,6 +215,49 @@ func TestKeysSQLWatchFansOutToReturnedKeys(t *testing.T) {
 	})
 	publisher.waitFor(t, "db:orders:t1")
 	publisher.waitFor(t, "db:orders:t2")
+}
+
+func TestOverCapLookupRecomputesLiveDocsWithoutRetrying(t *testing.T) {
+	t.Parallel()
+	query := ordersQuery()
+	query.Watches = []spec.Watch{{
+		Table:       "users",
+		KeysSQL:     "SELECT tenant_id FROM x WHERE user_id = $1",
+		KeysColumns: map[string]string{"$1": "id"},
+		MaxKeys:     2,
+	}}
+	other := spec.Query{
+		Name:    "inventory",
+		SQL:     "SELECT to_json($1::text)",
+		Watches: []spec.Watch{{Table: "inventory", Columns: []string{"tenant_id"}}},
+	}
+	runner := &fakeRunner{keysErr: fmt.Errorf("wrapped: %w", ErrTooManyKeys)}
+	publisher := newFakePublisher()
+	testEngine := startEngine(t, runner, publisher, query, other)
+	markLive(testEngine, "db:orders:t1", "db:orders:t2", "db:inventory:t1")
+
+	testEngine.HandleEvent(Event{
+		Table:   "public.users",
+		NewData: map[string]any{"id": "u1"},
+	})
+	// The fallback recomputes every live doc of the affected query only.
+	publisher.waitFor(t, "db:orders:t1")
+	publisher.waitFor(t, "db:orders:t2")
+	publisher.mutex.Lock()
+	_, otherPublished := publisher.published["db:inventory:t1"]
+	publisher.mutex.Unlock()
+	if otherPublished {
+		t.Fatal("the fallback must not touch other queries' live docs")
+	}
+	// Over the cap is permanent, so the lookup must not requeue: one keysSql
+	// run for the event, no retries after the fallback completed.
+	time.Sleep(50 * time.Millisecond)
+	runner.mutex.Lock()
+	keysCalls := runner.keysCalls
+	runner.mutex.Unlock()
+	if keysCalls != 1 {
+		t.Fatalf("keysSql ran %d times, want exactly 1", keysCalls)
+	}
 }
 
 func TestIdenticalLookupsCoalesce(t *testing.T) {

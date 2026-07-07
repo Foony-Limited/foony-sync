@@ -104,11 +104,18 @@ func (executor *Executor) RunDoc(ctx context.Context, sql string, args []any) (j
 	return doc, nil
 }
 
+// ErrTooManyKeys reports a keysSql result over the watch's maxKeys cap. The
+// engine matches it with errors.Is: unlike a transient query failure this is
+// permanent for the change that triggered it, so instead of retrying, the
+// engine recomputes every live doc of the query (a superset of the affected
+// docs, bounded by real subscribers).
+var ErrTooManyKeys = errors.New("dbsync: keys query returned more rows than maxKeys")
+
 // RunKeys executes a keysSql reverse index and returns up to maxKeys rows,
 // each row's values in column order (column i feeds query param $i+1).
-// Hitting the cap is an error by design: a truncated key set would silently
-// leave some docs stale, so the customer must tighten the query or raise
-// maxKeys instead.
+// Hitting the cap is ErrTooManyKeys by design: a truncated key set would
+// silently leave some docs stale, so the caller must fall back to something
+// that covers every affected doc.
 func (executor *Executor) RunKeys(ctx context.Context, sql string, args []any, maxKeys int) ([][]any, error) {
 	rows, err := executor.pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -118,7 +125,7 @@ func (executor *Executor) RunKeys(ctx context.Context, sql string, args []any, m
 	results := [][]any{}
 	for rows.Next() {
 		if len(results) >= maxKeys {
-			return nil, fmt.Errorf("dbsync: keys query returned more than maxKeys (%d) rows", maxKeys)
+			return nil, fmt.Errorf("%w (%d)", ErrTooManyKeys, maxKeys)
 		}
 		values, err := rows.Values()
 		if err != nil {

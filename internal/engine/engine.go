@@ -11,6 +11,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -447,8 +448,20 @@ func (engine *Engine) runLookup(ctx context.Context, key string, lookup pendingL
 		maxKeys = spec.DefaultMaxKeys
 	}
 	rows, err := engine.runner.RunKeys(ctx, lookup.watch.KeysSQL, lookup.args, maxKeys)
+	if errors.Is(err, ErrTooManyKeys) {
+		// Over the cap is permanent for this change: a retry runs the same
+		// query into the same cap. The fallback recomputes every live doc of
+		// the query, a superset of the affected docs bounded by real
+		// subscribers, so nothing goes stale and nothing loops.
+		marked := engine.markQueryLiveDirty(lookup.query.Name)
+		engine.logger.Warn("keysSql fan-out exceeded maxKeys, recomputing every live doc of the query instead",
+			"query", lookup.query.Name, "table", lookup.watch.Table, "args", logValue(lookup.args),
+			"maxKeys", maxKeys, "liveDocs", marked)
+		return
+	}
 	if err != nil {
-		engine.logger.Warn("keysSql failed", "query", lookup.query.Name, "table", lookup.watch.Table, "error", err.Error())
+		engine.logger.Warn("keysSql failed", "query", lookup.query.Name, "table", lookup.watch.Table,
+			"args", logValue(lookup.args), "error", err.Error())
 		// A dropped lookup would silently drop every doc it fans out to, so a
 		// transient failure requeues it after the retry pause.
 		engine.retryLater(ctx, func() { engine.requeueLookup(key, lookup) })
@@ -527,16 +540,46 @@ func (engine *Engine) noteSkippedValue(queryName, value string) {
 	// Log the first few and then sample, so a high-churn mismatch does not
 	// flood the agent's output.
 	if skipped <= 5 || skipped%1000 == 0 {
-		if len(value) > maxLoggedValueBytes {
-			value = value[:maxLoggedValueBytes] + "..."
-		}
 		engine.logger.Warn("param value cannot become a channel segment (allowed: A-Za-z0-9_- up to 64 bytes)",
-			"query", queryName, "value", value, "total", skipped)
+			"query", queryName, "value", logValue(value), "total", skipped)
 	}
 }
 
-// maxLoggedValueBytes caps a skipped value in the log so a mapped blob or
-// JSON column cannot dump kilobytes into one line.
+// markQueryLiveDirty marks every live doc of one query dirty. It is the
+// fallback when a reverse index cannot enumerate the affected docs (the
+// keysSql fan-out exceeded maxKeys): the query's whole live set is a superset
+// of the right answer and is bounded by real subscribers. Returns how many
+// docs it marked.
+func (engine *Engine) markQueryLiveDirty(queryName string) int {
+	exact := BuildChannel(queryName, nil)
+	prefix := exact + ":"
+	engine.mutex.Lock()
+	marked := 0
+	for channel := range engine.live {
+		if channel == exact || strings.HasPrefix(channel, prefix) {
+			engine.dirty[channel] = struct{}{}
+			marked++
+		}
+	}
+	engine.mutex.Unlock()
+	if marked > 0 {
+		engine.signal()
+	}
+	return marked
+}
+
+// logValue renders a customer value (a skipped doc key, keysSql args) for a
+// log line, capped so a mapped blob or JSON column cannot dump kilobytes into
+// one line.
+func logValue(value any) string {
+	text := fmt.Sprintf("%v", value)
+	if len(text) > maxLoggedValueBytes {
+		return text[:maxLoggedValueBytes] + "..."
+	}
+	return text
+}
+
+// maxLoggedValueBytes caps a logged customer value, see logValue.
 const maxLoggedValueBytes = 100
 
 // parseChannel resolves a db: channel to its query and raw param values.

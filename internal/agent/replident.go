@@ -40,7 +40,7 @@ func checkReplicaIdentities(ctx context.Context, pool *pgxpool.Pool, queries []s
 			continue
 		}
 		logger.Warn(fmt.Sprintf(
-			"table %s: watched column(s) %s are not in the replica identity, so DELETEs and key-changing UPDATEs cannot refresh their docs; fix with: ALTER TABLE %s REPLICA IDENTITY FULL",
+			"table %s: watched column(s) %s are not in the replica identity, so DELETEs and key-changing UPDATEs cannot refresh their docs. Fix with: ALTER TABLE %s REPLICA IDENTITY FULL",
 			table, strings.Join(missing, ", "), table))
 	}
 }
